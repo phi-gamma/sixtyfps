@@ -45,12 +45,13 @@ pub fn register_font_from_path(path: &std::path::Path) -> Result<(), Box<dyn std
     FONT_CACHE.with(|cache| {
         for face_info in cache.borrow().available_fonts.faces() {
             match &*face_info.source {
-                fontdb::Source::Binary(_) => {}
-                fontdb::Source::File(loaded_path) => {
+                fontdb::Source::File(loaded_path)
+                | fontdb::Source::SharedBinary(Some(loaded_path), _) => {
                     if *loaded_path == requested_path {
                         return Ok(());
                     }
                 }
+                fontdb::Source::Binary(_) | fontdb::Source::SharedBinary(None, _) => {}
             }
         }
 
@@ -261,13 +262,22 @@ impl FontCache {
 
         let fontdb_face_id =
             self.available_fonts.query(&query).expect("font database cannot be empty");
-        let femtovg_font_id = self
-            .available_fonts
-            .with_face_data(fontdb_face_id, |data, _index| {
-                // pass index to femtovg once femtovg/femtovg/pull/21 is merged
-                text_context.add_font_mem(data).unwrap()
-            })
-            .expect("unable to map font from disk");
+
+        // Safety: This call to fontdb calls mmap(), which is strictly speaking unsafe because
+        // somebody else might open the font file for writing and mess around with it,
+        // for example by truncating the file. We opt into this unsafety as with font files
+        // that's typically not the case. Package managers might remove font files, but they
+        // do that by unlinking the files first, which keeps the mapping intact. Using mmap()
+        // to make fonts accessible is also how freetype works by default and now Qt and Pango
+        // access fonts.
+        let (font_data, face_index) = unsafe {
+            self.available_fonts
+                .make_shared_face_data(fontdb_face_id)
+                .expect("unable to map font from disk")
+        };
+
+        let femtovg_font_id =
+            text_context.add_shared_font_with_index(font_data, face_index).unwrap();
         //println!("Loaded {:#?} in {}ms.", request, now.elapsed().as_millis());
         let new_font = LoadedFont { femtovg_font_id, fontdb_face_id };
         self.loaded_fonts.insert(cache_key, new_font);
